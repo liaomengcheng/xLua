@@ -175,70 +175,87 @@ namespace XLua
 
         public int Call(RealStatePtr L)
         {
-            object target = null;
-            MethodBase toInvoke = method;
-
-            if (luaStackPosStart > 1)
+            try
             {
-                target = translator.FastGetCSObj(L, 1);
-                if (target is Delegate)
-                {
-                    Delegate delegateInvoke = (Delegate)target;
-                    toInvoke = delegateInvoke.Method;
-                }
-            }
+                object target = null;
+                MethodBase toInvoke = method;
 
-
-            int luaTop = LuaAPI.lua_gettop(L);
-            int luaStackPos = luaStackPosStart;
-
-            for (int i = 0; i < castArray.Length; i++)
-            {
-                //UnityEngine.Debug.Log("inPos:" + inPosArray[i]);
-                if (luaStackPos > luaTop) //after check
+                if (luaStackPosStart > 1)
                 {
-                    args[inPosArray[i]] = defaultValueArray[i];
-                }
-                else
-                {
-                    if (paramsType != null && i == castArray.Length - 1)
+                    target = translator.FastGetCSObj(L, 1);
+                    if (target is Delegate)
                     {
-                        args[inPosArray[i]] = translator.GetParams(L, luaStackPos, paramsType);
+                        Delegate delegateInvoke = (Delegate)target;
+                        toInvoke = delegateInvoke.Method;
+                    }
+                }
+
+
+                int luaTop = LuaAPI.lua_gettop(L);
+                int luaStackPos = luaStackPosStart;
+
+                for (int i = 0; i < castArray.Length; i++)
+                {
+                    //UnityEngine.Debug.Log("inPos:" + inPosArray[i]);
+                    if (luaStackPos > luaTop) //after check
+                    {
+                        if (paramsType != null && i == castArray.Length - 1)
+                        {
+                            args[inPosArray[i]] = Array.CreateInstance(paramsType, 0);
+                        }
+                        else
+                        {
+                            args[inPosArray[i]] = defaultValueArray[i];
+                        }
                     }
                     else
                     {
-                        args[inPosArray[i]] = castArray[i](L, luaStackPos, null);
+                        if (paramsType != null && i == castArray.Length - 1)
+                        {
+                            args[inPosArray[i]] = translator.GetParams(L, luaStackPos, paramsType);
+                        }
+                        else
+                        {
+                            args[inPosArray[i]] = castArray[i](L, luaStackPos, null);
+                        }
+                        luaStackPos++;
                     }
-                    luaStackPos++;
+                    //UnityEngine.Debug.Log("value:" + args[inPosArray[i]]);
                 }
-                //UnityEngine.Debug.Log("value:" + args[inPosArray[i]]);
-            }
 
-            object ret = null;
+                object ret = null;
 
 
-            ret = toInvoke.IsConstructor ? ((ConstructorInfo)method).Invoke(args) : method.Invoke(targetNeeded ? target : null, args);
+                ret = toInvoke.IsConstructor ? ((ConstructorInfo)method).Invoke(args) : method.Invoke(targetNeeded ? target : null, args);
 
-            int nRet = 0;
+                int nRet = 0;
 
-            if (!isVoid)
-            {
-                //UnityEngine.Debug.Log(toInvoke.ToString() + " ret:" + ret);
-                translator.PushAny(L, ret);
-                nRet++;
-            }
-
-            for (int i = 0; i < outPosArray.Length; i++)
-            {
-                if (refPos[outPosArray[i]] != -1)
+                if (!isVoid)
                 {
-                    translator.Update(L, luaStackPosStart + refPos[outPosArray[i]], args[outPosArray[i]]);
+                    //UnityEngine.Debug.Log(toInvoke.ToString() + " ret:" + ret);
+                    translator.PushAny(L, ret);
+                    nRet++;
                 }
-                translator.PushAny(L, args[outPosArray[i]]);
-                nRet++;
-            }
 
-            return nRet;
+                for (int i = 0; i < outPosArray.Length; i++)
+                {
+                    if (refPos[outPosArray[i]] != -1)
+                    {
+                        translator.Update(L, luaStackPosStart + refPos[outPosArray[i]], args[outPosArray[i]]);
+                    }
+                    translator.PushAny(L, args[outPosArray[i]]);
+                    nRet++;
+                }
+
+                return nRet;
+            }
+            finally
+            {
+                for(int i = 0; i < args.Length; i++)
+                {
+                    args[i] = null;
+                }
+            }
         }
     }
 
@@ -320,7 +337,43 @@ namespace XLua
                 }
                 else
                 {
-                    constructorCache[type] = _GenMethodWrap(type, ".ctor", constructors).Call;
+                    LuaCSFunction ctor = _GenMethodWrap(type, ".ctor", constructors).Call;
+                    
+                    if (type.IsValueType)
+                    {
+                        bool hasZeroParamsCtor = false;
+                        for (int i = 0; i < constructors.Length; i++)
+                        {
+                            if (constructors[i].GetParameters().Length == 0)
+                            {
+                                hasZeroParamsCtor = true;
+                                break;
+                            }
+                        }
+                        if (hasZeroParamsCtor)
+                        {
+                            constructorCache[type] = ctor;
+                        }
+                        else
+                        {
+                            constructorCache[type] = (L) =>
+                            {
+                                if (LuaAPI.lua_gettop(L) == 1)
+                                {
+                                    translator.PushAny(L, Activator.CreateInstance(type));
+                                    return 1;
+                                }
+                                else
+                                {
+                                    return ctor(L);
+                                }
+                            };
+                        }
+                    }
+                    else
+                    {
+                        constructorCache[type] = ctor;
+                    }
                 }
             }
             return constructorCache[type];
@@ -453,14 +506,41 @@ namespace XLua
             List<OverloadMethodWrap> overloads = new List<OverloadMethodWrap>();
             foreach(var methodBase in methodBases)
             {
-                if (methodBase is MethodBase && !(methodBase as MethodBase).ContainsGenericParameters)
-                {
-                    var overload = new OverloadMethodWrap(translator, type, methodBase as MethodBase);
-                    overload.Init(objCheckers, objCasters);
-                    overloads.Add(overload);
-                }
+                var mb = methodBase as MethodBase;
+                if (mb == null)
+                    continue;
+
+                if (mb.IsGenericMethodDefinition && !tryMakeGenericMethod(ref mb))
+                    continue;
+
+                var overload = new OverloadMethodWrap(translator, type, mb);
+                overload.Init(objCheckers, objCasters);
+                overloads.Add(overload);
             }
             return new MethodWrap(methodName, overloads);
+        }
+
+        private static bool tryMakeGenericMethod(ref MethodBase method)
+        {
+            try
+            {
+                var genericArguments = method.GetGenericArguments();
+                var constraintedArgumentTypes = new Type[genericArguments.Length];
+                for (var i = 0; i < genericArguments.Length; i++)
+                {
+                    var argumentType = genericArguments[i];
+                    var parameterConstraints = argumentType.GetGenericParameterConstraints();
+                    if (parameterConstraints.Length == 0 || !parameterConstraints[0].IsClass)
+                        return false;
+                    constraintedArgumentTypes[i] = parameterConstraints[0];
+                }
+                method = ((MethodInfo)method).MakeGenericMethod(constraintedArgumentTypes);
+                return true;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
     }
 }
